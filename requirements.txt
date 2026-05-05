@@ -3,9 +3,10 @@ uvicorn
 python-dotenv
 livekit
 livekit-api
-pipecat-ai
+pipecat-ai[livekit,openai]
 openai
 sarvamai
 aiohttp
 loguru
 gunicorn
+tenacity

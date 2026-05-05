@@ -1,0 +1,277 @@
+<!--
+  Lead Logger — Bubble HTML Element Snippet
+  ─────────────────────────────────────────
+  Paste this entire block into a Bubble "HTML" element.
+  Configure the three variables at the top of the <script> section.
+
+  Flow:
+    1. User clicks 🎙 → fetches a LiveKit token from your token endpoint
+    2. Connects to LiveKit room, publishes mic, subscribes to agent audio
+    3. When agent disconnects (session complete), UI resets automatically
+-->
+
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8" />
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: transparent;
+    }
+
+    #lead-logger-widget {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 14px;
+      padding: 24px 16px;
+    }
+
+    #mic-btn {
+      width: 80px;
+      height: 80px;
+      border-radius: 50%;
+      border: none;
+      background: #2563eb;
+      color: white;
+      font-size: 32px;
+      cursor: pointer;
+      transition: background 0.2s, transform 0.15s;
+      box-shadow: 0 4px 18px rgba(37,99,235,0.35);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    #mic-btn:hover  { background: #1d4ed8; transform: scale(1.05); }
+    #mic-btn.active { background: #dc2626; animation: pulse 1.2s infinite; }
+    #mic-btn:disabled { background: #94a3b8; cursor: not-allowed; transform: none; }
+
+    @keyframes pulse {
+      0%,100% { box-shadow: 0 0 0 0 rgba(220,38,38,.5); }
+      50%      { box-shadow: 0 0 0 14px rgba(220,38,38,0); }
+    }
+
+    #status-label {
+      font-size: 14px;
+      font-weight: 500;
+      color: #475569;
+      text-align: center;
+      min-height: 20px;
+    }
+
+    #field-progress {
+      width: 100%;
+      max-width: 320px;
+      background: #e2e8f0;
+      border-radius: 8px;
+      height: 8px;
+      overflow: hidden;
+    }
+    #progress-bar {
+      height: 100%;
+      width: 0%;
+      background: linear-gradient(90deg, #2563eb, #7c3aed);
+      border-radius: 8px;
+      transition: width 0.4s ease;
+    }
+
+    #progress-text {
+      font-size: 12px;
+      color: #64748b;
+    }
+
+    #log-output {
+      width: 100%;
+      max-width: 340px;
+      max-height: 120px;
+      overflow-y: auto;
+      background: #f8fafc;
+      border: 1px solid #e2e8f0;
+      border-radius: 8px;
+      padding: 8px 10px;
+      font-size: 12px;
+      color: #334155;
+      line-height: 1.5;
+      display: none;
+    }
+  </style>
+</head>
+<body>
+  <div id="lead-logger-widget">
+    <button id="mic-btn" title="Start / Stop conversation">🎙️</button>
+    <div id="status-label">Tap to start logging a lead</div>
+    <div id="field-progress">
+      <div id="progress-bar"></div>
+    </div>
+    <div id="progress-text">0 / 10 fields collected</div>
+    <div id="log-output"></div>
+  </div>
+
+  <!-- LiveKit JS SDK (latest v2 compatible) -->
+  <script src="https://cdn.jsdelivr.net/npm/livekit-client/dist/livekit-client.umd.min.js"></script>
+
+  <script>
+    // ═══════════════════════════════════════════════════════════════════════
+    // ✏️  CONFIGURE THESE THREE VALUES
+    // ═══════════════════════════════════════════════════════════════════════
+    const LIVEKIT_URL        = "wss://YOUR-LIVEKIT-SERVER.livekit.cloud";  // your LiveKit server URL
+    const TOKEN_ENDPOINT     = "https://YOUR-TOKEN-SERVER/token";          // your token generation endpoint
+    const ROOM_NAME          = "lead-logger-room";                         // must match Python --room arg
+    // ═══════════════════════════════════════════════════════════════════════
+
+    const TOTAL_FIELDS = 10;
+
+    let room       = null;
+    let connected  = false;
+    let fieldCount = 0;
+
+    const micBtn       = document.getElementById("mic-btn");
+    const statusLabel  = document.getElementById("status-label");
+    const progressBar  = document.getElementById("progress-bar");
+    const progressText = document.getElementById("progress-text");
+    const logOutput    = document.getElementById("log-output");
+
+    // ── Helpers ─────────────────────────────────────────────────────────────
+    function setStatus(msg, color = "#475569") {
+      statusLabel.textContent = msg;
+      statusLabel.style.color = color;
+    }
+
+    function appendLog(msg) {
+      logOutput.style.display = "block";
+      const line = document.createElement("div");
+      line.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+      logOutput.appendChild(line);
+      logOutput.scrollTop = logOutput.scrollHeight;
+    }
+
+    function updateProgress(count) {
+      fieldCount = Math.min(count, TOTAL_FIELDS);
+      const pct = (fieldCount / TOTAL_FIELDS) * 100;
+      progressBar.style.width = pct + "%";
+      progressText.textContent = `${fieldCount} / ${TOTAL_FIELDS} fields collected`;
+    }
+
+    // ── Fetch LiveKit token from your token server ───────────────────────────
+    async function fetchToken(identity) {
+      const resp = await fetch(
+        `${TOKEN_ENDPOINT}?room=${encodeURIComponent(ROOM_NAME)}&identity=${encodeURIComponent(identity)}`,
+        { method: "GET" }
+      );
+      if (!resp.ok) throw new Error(`Token fetch failed: ${resp.status}`);
+      const data = await resp.json();
+      return data.token; // adjust key if your endpoint returns differently
+    }
+
+    // ── Connect to LiveKit room ──────────────────────────────────────────────
+    async function connect() {
+      micBtn.disabled = true;
+      setStatus("Connecting…", "#f59e0b");
+
+      try {
+        const identity = "cre-" + Math.random().toString(36).slice(2, 8);
+        const token    = await fetchToken(identity);
+
+        room = new LivekitClient.Room({
+          adaptiveStream: true,
+          dynacast: true,
+          audioCaptureDefaults: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+            sampleRate: 16000,
+          },
+        });
+
+        // ── Room events ──────────────────────────────────────────────────────
+        room.on(LivekitClient.RoomEvent.Connected, () => {
+          connected = true;
+          micBtn.classList.add("active");
+          micBtn.innerHTML = "🔴";
+          micBtn.disabled  = false;
+          setStatus("🎙 Recording — speak now", "#16a34a");
+          appendLog("Connected to Lead Logger agent");
+        });
+
+        room.on(LivekitClient.RoomEvent.Disconnected, () => {
+          handleDisconnect("Session ended");
+        });
+
+        room.on(LivekitClient.RoomEvent.ParticipantDisconnected, (participant) => {
+          if (participant.identity === "LeadLogger") {
+            appendLog("✅ Agent disconnected — lead logged");
+            handleDisconnect("Lead logged ✅");
+          }
+        });
+
+        // ── Agent audio: play incoming TTS audio ─────────────────────────────
+        room.on(LivekitClient.RoomEvent.TrackSubscribed, (track, publication, participant) => {
+          if (
+            participant.identity === "LeadLogger" &&
+            track.kind === LivekitClient.Track.Kind.Audio
+          ) {
+            const audioElement = track.attach();
+            audioElement.autoplay = true;
+            audioElement.style.display = "none";
+            document.body.appendChild(audioElement);
+            appendLog("Agent audio stream ready");
+          }
+        });
+
+        // ── Data channel: receive field-count updates from agent ─────────────
+        room.on(LivekitClient.RoomEvent.DataReceived, (data, participant) => {
+          try {
+            const msg = JSON.parse(new TextDecoder().decode(data));
+            if (msg.type === "field_progress") {
+              updateProgress(msg.count);
+            }
+          } catch (_) { /* non-JSON data — ignore */ }
+        });
+
+        // ── Connect and publish mic ───────────────────────────────────────────
+        await room.connect(LIVEKIT_URL, token, { autoSubscribe: true });
+        await room.localParticipant.setMicrophoneEnabled(true);
+
+      } catch (err) {
+        console.error("LiveKit connect error:", err);
+        setStatus("Connection failed — tap to retry", "#dc2626");
+        micBtn.classList.remove("active");
+        micBtn.innerHTML = "🎙️";
+        micBtn.disabled  = false;
+        appendLog("ERROR: " + err.message);
+      }
+    }
+
+    // ── Disconnect from room ─────────────────────────────────────────────────
+    async function disconnect() {
+      if (room) {
+        await room.disconnect();
+        room = null;
+      }
+      handleDisconnect("Disconnected");
+    }
+
+    function handleDisconnect(message) {
+      connected = false;
+      micBtn.classList.remove("active");
+      micBtn.innerHTML = "🎙️";
+      micBtn.disabled  = false;
+      setStatus(message, "#475569");
+      appendLog(message);
+    }
+
+    // ── Mic button toggle ────────────────────────────────────────────────────
+    micBtn.addEventListener("click", async () => {
+      if (!connected) {
+        updateProgress(0);
+        await connect();
+      } else {
+        await disconnect();
+      }
+    });
+  </script>
+</body>
+</html>
